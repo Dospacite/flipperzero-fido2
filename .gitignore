@@ -1,0 +1,7 @@
+.ufbt/
+.venv/
+.vscode/
+dist/
+*.map
+*.pyc
+__pycache__/
