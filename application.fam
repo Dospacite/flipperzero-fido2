@@ -1,7 +1,7 @@
 App(
     appid="fido2_security_key",
     name="FIDO2 Security Key",
-    apptype=FlipperAppType.MENUEXTERNAL,
+    apptype=FlipperAppType.EXTERNAL,
     entry_point="u2f_app",
     stack_size=2 * 1024,
     icon="A_U2F_14",
