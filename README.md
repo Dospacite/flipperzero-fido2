@@ -1,8 +1,9 @@
 # FIDO2 Security Key for Flipper Zero
 
 A standalone Flipper Zero application that exposes the device as a USB FIDO2/U2F security key.
-It implements the CTAP2 `hmac-secret` extension required by `systemd-cryptenroll`, allowing a
-Flipper to unlock a LUKS2 volume while the application is running.
+It supports ordinary WebAuthn registrations and assertions with an explicit Flipper OK-button
+confirmation, as well as the CTAP2 `hmac-secret` extension required by `systemd-cryptenroll`.
+The latter can unlock a LUKS2 volume while the application is running.
 
 This repository contains only the application. It does not require or carry a firmware fork.
 The current build target is [Momentum Firmware](https://github.com/Next-Flip/Momentum-Firmware)
@@ -14,12 +15,13 @@ mntm-012 (Flipper API 87.1).
 - `authenticatorGetInfo`
 - ES256 `authenticatorMakeCredential` with self-contained credential IDs
 - `authenticatorGetAssertion`, including pre-flight assertions
+- WebAuthn user presence: press the Flipper's OK button to register or authenticate
 - PIN/UV protocol 1 key agreement for `hmac-secret`
 - Compatibility with the stock U2F application's `/ext/u2f` device key and certificate data
 
-The application intentionally advertises no resident-key, client-PIN, user-presence, or
-user-verification support. It is designed for unattended, possession-based disk unlock. It emits
-`none` attestation and is not a certified or tamper-resistant hardware authenticator.
+The application does not support resident keys, client PINs, or user verification. It emits
+`none` attestation and is not a certified or tamper-resistant hardware authenticator. WebAuthn
+credentials are non-discoverable, so enter your account identifier before using one to sign in.
 
 ## Build
 

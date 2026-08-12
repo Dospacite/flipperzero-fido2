@@ -30,6 +30,12 @@ void u2f_set_event_callback(U2fData* instance, U2fEvtCallback callback, void* co
 
 void u2f_confirm_user_present(U2fData* instance);
 
+/** Ask the UI to display a user-presence prompt for a CTAP2 operation. */
+void u2f_request_user_presence(U2fData* instance, bool registration);
+
+/** Return and clear a confirmation made with the Flipper's OK button. */
+bool u2f_consume_user_presence(U2fData* instance);
+
 uint16_t u2f_msg_parse(U2fData* instance, uint8_t* buf, uint16_t len);
 
 /** Device-unique secret used by the CTAP2 credential derivation code. */

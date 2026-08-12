@@ -94,7 +94,7 @@ struct U2fData {
     uint8_t cert_key[U2F_EC_KEY_SIZE];
     uint32_t counter;
     bool ready;
-    bool user_present;
+    volatile bool user_present;
     U2fEvtCallback callback;
     void* context;
     mbedtls_ecp_group group;
@@ -159,6 +159,21 @@ void u2f_set_event_callback(U2fData* U2F, U2fEvtCallback callback, void* context
 
 void u2f_confirm_user_present(U2fData* U2F) {
     U2F->user_present = true;
+}
+
+void u2f_request_user_presence(U2fData* U2F, bool registration) {
+    furi_assert(U2F);
+    U2F->user_present = false;
+    if(U2F->callback != NULL) {
+        U2F->callback(registration ? U2fNotifyRegister : U2fNotifyAuth, U2F->context);
+    }
+}
+
+bool u2f_consume_user_presence(U2fData* U2F) {
+    furi_assert(U2F);
+    if(!U2F->user_present) return false;
+    U2F->user_present = false;
+    return true;
 }
 
 static uint8_t u2f_der_encode_int(uint8_t* der, uint8_t* val, uint8_t val_len) {

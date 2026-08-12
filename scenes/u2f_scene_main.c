@@ -4,7 +4,7 @@
 #include <furi_hal.h>
 #include "../u2f.h"
 
-#define U2F_REQUEST_TIMEOUT 500
+#define U2F_REQUEST_TIMEOUT 15000
 #define U2F_SUCCESS_TIMEOUT 3000
 
 static void u2f_scene_main_ok_callback(InputType type, void* context) {

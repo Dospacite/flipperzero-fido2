@@ -28,6 +28,10 @@
 #define U2F_HID_CANCEL (U2F_HID_TYPE_INIT | 0x11) // Cancel current CTAP2 transaction
 #define U2F_HID_ERROR  (U2F_HID_TYPE_INIT | 0x3f) // Error response
 
+#define U2F_HID_KEEPALIVE (U2F_HID_TYPE_INIT | 0x3b) // CTAP operation progress
+
+#define CTAPHID_KEEPALIVE_STATUS_UPNEEDED 0x02
+
 #define U2F_HID_ERR_NONE          0x00 // No error
 #define U2F_HID_ERR_INVALID_CMD   0x01 // Invalid command
 #define U2F_HID_ERR_INVALID_PAR   0x02 // Invalid parameter
@@ -69,6 +73,26 @@ struct U2fHid {
     Ctap2* ctap2;
     struct U2fHid_packet packet;
 };
+
+static void u2f_hid_request_user_presence(void* context, bool registration) {
+    U2fHid* u2f_hid = context;
+    u2f_request_user_presence(u2f_hid->u2f_instance, registration);
+}
+
+static bool u2f_hid_consume_user_presence(void* context) {
+    U2fHid* u2f_hid = context;
+    return u2f_consume_user_presence(u2f_hid->u2f_instance);
+}
+
+static void u2f_hid_send_keepalive(void* context) {
+    U2fHid* u2f_hid = context;
+    uint8_t packet_buf[HID_U2F_PACKET_LEN] = {0};
+    memcpy(packet_buf, &u2f_hid->packet.cid, sizeof(u2f_hid->packet.cid));
+    packet_buf[4] = U2F_HID_KEEPALIVE;
+    packet_buf[6] = 1;
+    packet_buf[7] = CTAPHID_KEEPALIVE_STATUS_UPNEEDED;
+    furi_hal_hid_u2f_send_response(packet_buf, sizeof(packet_buf));
+}
 
 static void u2f_hid_event_callback(HidU2fEvent ev, void* context) {
     furi_assert(context);
@@ -321,7 +345,12 @@ U2fHid* u2f_hid_start(U2fData* u2f_inst) {
 
     u2f_hid->u2f_instance = u2f_inst;
 
-    u2f_hid->ctap2 = ctap2_alloc(u2f_get_device_key(u2f_inst));
+    u2f_hid->ctap2 = ctap2_alloc(
+        u2f_get_device_key(u2f_inst),
+        u2f_hid_request_user_presence,
+        u2f_hid_consume_user_presence,
+        u2f_hid_send_keepalive,
+        u2f_hid);
     if(!u2f_hid->ctap2) {
         free(u2f_hid);
         return NULL;

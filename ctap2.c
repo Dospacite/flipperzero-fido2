@@ -1,5 +1,6 @@
 #include "ctap2.h"
 
+#include <furi.h>
 #include <furi_hal_random.h>
 
 #include <mbedtls/aes.h>
@@ -22,6 +23,7 @@
 #define CTAP2_ERR_INVALID_CBOR         0x12
 #define CTAP2_ERR_MISSING_PARAMETER    0x14
 #define CTAP2_ERR_CREDENTIAL_EXCLUDED  0x19
+#define CTAP2_ERR_OPERATION_DENIED     0x27
 #define CTAP2_ERR_NO_CREDENTIALS       0x2E
 #define CTAP2_ERR_INTEGRITY_FAILURE    0x3D
 #define CTAP2_ERR_UNSUPPORTED_OPTION   0x2B
@@ -65,6 +67,7 @@ typedef struct {
     const uint8_t* rp_id;
     size_t rp_id_len;
     bool hmac_secret;
+    bool user_presence;
 } MakeCredentialRequest;
 
 typedef struct {
@@ -82,6 +85,7 @@ typedef struct {
     size_t salt_auth_len;
     uint64_t pin_protocol;
     bool hmac_secret;
+    bool user_presence;
 } GetAssertionRequest;
 
 struct Ctap2 {
@@ -90,7 +94,16 @@ struct Ctap2 {
     uint8_t key_agreement_x[32];
     uint8_t key_agreement_y[32];
     mbedtls_ecp_group group;
+    Ctap2UserPresenceRequest request_user_presence;
+    Ctap2UserPresenceConsume consume_user_presence;
+    Ctap2Keepalive send_keepalive;
+    void* user_presence_context;
 };
+
+/* Browser CTAP transactions normally have a 30-second timeout. */
+#define CTAP2_USER_PRESENCE_TIMEOUT_MS 15000
+#define CTAP2_USER_PRESENCE_POLL_MS    50
+#define CTAP2_KEEPALIVE_INTERVAL_MS    500
 
 static bool ctap2_random(void* context, uint8_t* output, size_t size) {
     UNUSED(context);
@@ -107,6 +120,21 @@ static bool ctap2_ct_equal(const uint8_t* left, const uint8_t* right, size_t len
     for(size_t i = 0; i < length; ++i)
         difference |= left[i] ^ right[i];
     return difference == 0;
+}
+
+static bool ctap2_wait_for_user_presence(Ctap2* ctap2, bool registration) {
+    if(!ctap2->request_user_presence || !ctap2->consume_user_presence) return false;
+
+    ctap2->request_user_presence(ctap2->user_presence_context, registration);
+    for(uint32_t waited = 0; waited < CTAP2_USER_PRESENCE_TIMEOUT_MS;
+        waited += CTAP2_USER_PRESENCE_POLL_MS) {
+        if(ctap2->consume_user_presence(ctap2->user_presence_context)) return true;
+        if(ctap2->send_keepalive && waited % CTAP2_KEEPALIVE_INTERVAL_MS == 0) {
+            ctap2->send_keepalive(ctap2->user_presence_context);
+        }
+        furi_delay_ms(CTAP2_USER_PRESENCE_POLL_MS);
+    }
+    return false;
 }
 
 static bool cbor_read_head(CborReader* reader, uint8_t* major, uint64_t* value) {
@@ -488,11 +516,28 @@ static bool ctap2_parse_make_extensions(CborReader* reader, bool* hmac_secret) {
     return true;
 }
 
+static bool ctap2_parse_user_presence_option(CborReader* reader, bool* user_presence) {
+    size_t count;
+    if(!cbor_enter(reader, 5, &count)) return false;
+    for(size_t i = 0; i < count; ++i) {
+        const uint8_t* key;
+        size_t key_length;
+        if(!cbor_read_bytes(reader, 3, &key, &key_length)) return false;
+        if(cbor_text_equals(key, key_length, "up")) {
+            if(!cbor_read_bool(reader, user_presence)) return false;
+        } else if(!cbor_skip(reader)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ctap2_parse_make_credential(
     const uint8_t* input,
     size_t input_length,
     MakeCredentialRequest* request) {
     memset(request, 0, sizeof(*request));
+    request->user_presence = true;
     CborReader reader = {.ptr = input, .end = input + input_length};
     size_t count;
     if(!cbor_enter(&reader, 5, &count)) return false;
@@ -503,6 +548,8 @@ static bool ctap2_parse_make_credential(
             if(!ctap2_parse_rp(&reader, &request->rp_id, &request->rp_id_len)) return false;
         } else if(key == 6) {
             if(!ctap2_parse_make_extensions(&reader, &request->hmac_secret)) return false;
+        } else if(key == 7) {
+            if(!ctap2_parse_user_presence_option(&reader, &request->user_presence)) return false;
         } else if(!cbor_skip(&reader)) {
             return false;
         }
@@ -606,6 +653,7 @@ static bool ctap2_parse_get_assertion(
     GetAssertionRequest* request) {
     memset(request, 0, sizeof(*request));
     request->pin_protocol = 1;
+    request->user_presence = true;
     CborReader reader = {.ptr = input, .end = input + input_length};
     size_t count;
     if(!cbor_enter(&reader, 5, &count)) return false;
@@ -624,6 +672,8 @@ static bool ctap2_parse_get_assertion(
                 return false;
         } else if(key == 4) {
             if(!ctap2_parse_get_extensions(&reader, request)) return false;
+        } else if(key == 5) {
+            if(!ctap2_parse_user_presence_option(&reader, &request->user_presence)) return false;
         } else if(!cbor_skip(&reader)) {
             return false;
         }
@@ -665,7 +715,7 @@ static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
     cbor_write_text(&writer, "rk");
     cbor_write_bool(&writer, false);
     cbor_write_text(&writer, "up");
-    cbor_write_bool(&writer, false);
+    cbor_write_bool(&writer, true);
     cbor_write_text(&writer, "plat");
     cbor_write_bool(&writer, false);
     cbor_write_text(&writer, "clientPin");
@@ -733,7 +783,13 @@ static uint16_t ctap2_make_credential(
     uint32_t counter) {
     MakeCredentialRequest request;
     if(!ctap2_parse_make_credential(input, input_length, &request)) return CTAP2_ERR_INVALID_CBOR;
-    if(!request.hmac_secret) return CTAP2_ERR_UNSUPPORTED_OPTION;
+
+    /* hmac-secret is optional for WebAuthn.  Explicit up=false preserves LUKS. */
+    bool webauthn_user_present = false;
+    if(request.user_presence) {
+        webauthn_user_present = ctap2_wait_for_user_presence(ctap2, true);
+        if(!webauthn_user_present) return CTAP2_ERR_OPERATION_DENIED;
+    }
 
     uint8_t rp_hash[32];
     uint8_t credential_id[CTAP2_CREDENTIAL_ID_SIZE];
@@ -747,11 +803,15 @@ static uint16_t ctap2_make_credential(
        !ctap2_public_key(ctap2, private_key, public_x, public_y))
         return 0;
 
+    /* The ED flag and trailing extension map must always be emitted together. */
+    const bool has_extension_data = request.hmac_secret;
+
     uint8_t auth_data[256];
     uint8_t* cursor = auth_data;
     memcpy(cursor, rp_hash, 32);
     cursor += 32;
-    *cursor++ = 0xC0; /* AT + ED, intentionally no UP for unattended unlock */
+    *cursor++ = 0x40 | (webauthn_user_present ? 0x01 : 0) |
+                (has_extension_data ? 0x80 : 0);
     *cursor++ = counter >> 24;
     *cursor++ = counter >> 16;
     *cursor++ = counter >> 8;
@@ -765,9 +825,11 @@ static uint16_t ctap2_make_credential(
 
     CborWriter auth_writer = {.ptr = cursor, .end = auth_data + sizeof(auth_data)};
     ctap2_write_cose_key(&auth_writer, -7, public_x, public_y);
-    cbor_write_map(&auth_writer, 1);
-    cbor_write_text(&auth_writer, "hmac-secret");
-    cbor_write_bool(&auth_writer, true);
+    if(has_extension_data) {
+        cbor_write_map(&auth_writer, 1);
+        cbor_write_text(&auth_writer, "hmac-secret");
+        cbor_write_bool(&auth_writer, true);
+    }
     if(auth_writer.error) return 0;
     cursor = auth_writer.ptr;
 
@@ -850,6 +912,14 @@ static uint16_t ctap2_get_assertion(
         request.salt_auth_len != 16))
         return CTAP2_ERR_INVALID_PARAMETER;
 
+    /*
+     * Ordinary WebAuthn assertions require a physical confirmation.  Preserve
+     * the existing explicit up=false path used by unattended disk unlock.
+    */
+    bool user_present = request.user_presence;
+    if(user_present && !ctap2_wait_for_user_presence(ctap2, false))
+        return CTAP2_ERR_OPERATION_DENIED;
+
     uint8_t rp_hash[32];
     uint8_t expected_tag[32];
     if(!ctap2_sha256(request.rp_id, request.rp_id_len, rp_hash) ||
@@ -901,7 +971,7 @@ static uint16_t ctap2_get_assertion(
     uint8_t* cursor = auth_data;
     memcpy(cursor, rp_hash, 32);
     cursor += 32;
-    *cursor++ = request.hmac_secret ? 0x80 : 0x00; /* ED when hmac-secret is returned; no UP */
+    *cursor++ = (user_present ? 0x01 : 0) | (request.hmac_secret ? 0x80 : 0);
     *cursor++ = counter >> 24;
     *cursor++ = counter >> 16;
     *cursor++ = counter >> 8;
@@ -950,11 +1020,20 @@ static uint16_t ctap2_get_assertion(
     return writer.error ? 0 : writer.ptr - output;
 }
 
-Ctap2* ctap2_alloc(const uint8_t device_key[32]) {
+Ctap2* ctap2_alloc(
+    const uint8_t device_key[32],
+    Ctap2UserPresenceRequest request_user_presence,
+    Ctap2UserPresenceConsume consume_user_presence,
+    Ctap2Keepalive send_keepalive,
+    void* user_presence_context) {
     Ctap2* ctap2 = malloc(sizeof(Ctap2));
     if(!ctap2) return NULL;
     memset(ctap2, 0, sizeof(*ctap2));
     memcpy(ctap2->device_key, device_key, 32);
+    ctap2->request_user_presence = request_user_presence;
+    ctap2->consume_user_presence = consume_user_presence;
+    ctap2->send_keepalive = send_keepalive;
+    ctap2->user_presence_context = user_presence_context;
     mbedtls_ecp_group_init(&ctap2->group);
     if(mbedtls_ecp_group_load(&ctap2->group, MBEDTLS_ECP_DP_SECP256R1) != 0) {
         ctap2_free(ctap2);
