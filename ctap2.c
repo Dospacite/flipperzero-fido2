@@ -1,4 +1,5 @@
 #include "ctap2.h"
+#include "u2f_data.h"
 
 #include <furi.h>
 #include <furi_hal_random.h>
@@ -24,6 +25,7 @@
 #define CTAP2_ERR_MISSING_PARAMETER    0x14
 #define CTAP2_ERR_CREDENTIAL_EXCLUDED  0x19
 #define CTAP2_ERR_OPERATION_DENIED     0x27
+#define CTAP2_ERR_KEY_STORE_FULL       0x28
 #define CTAP2_ERR_NO_CREDENTIALS       0x2E
 #define CTAP2_ERR_INTEGRITY_FAILURE    0x3D
 #define CTAP2_ERR_UNSUPPORTED_OPTION   0x2B
@@ -66,8 +68,11 @@ typedef struct {
 typedef struct {
     const uint8_t* rp_id;
     size_t rp_id_len;
+    const uint8_t* user_id;
+    size_t user_id_len;
     bool hmac_secret;
     bool user_presence;
+    bool resident_key;
 } MakeCredentialRequest;
 
 typedef struct {
@@ -77,6 +82,7 @@ typedef struct {
     size_t client_data_hash_len;
     const uint8_t* credential_id;
     size_t credential_id_len;
+    bool allow_list_present;
     uint8_t key_x[32];
     uint8_t key_y[32];
     const uint8_t* salt_enc;
@@ -516,7 +522,21 @@ static bool ctap2_parse_make_extensions(CborReader* reader, bool* hmac_secret) {
     return true;
 }
 
-static bool ctap2_parse_user_presence_option(CborReader* reader, bool* user_presence) {
+static bool ctap2_parse_user(CborReader* reader, const uint8_t** user_id, size_t* user_id_len) {
+    size_t count;
+    if(!cbor_enter(reader, 5, &count)) return false;
+    for(size_t i = 0; i < count; ++i) {
+        const uint8_t* key;
+        size_t key_len;
+        if(!cbor_read_bytes(reader, 3, &key, &key_len)) return false;
+        if(cbor_text_equals(key, key_len, "id")) {
+            if(!cbor_read_bytes(reader, 2, user_id, user_id_len)) return false;
+        } else if(!cbor_skip(reader)) return false;
+    }
+    return *user_id != NULL;
+}
+
+static bool ctap2_parse_make_options(CborReader* reader, MakeCredentialRequest* request) {
     size_t count;
     if(!cbor_enter(reader, 5, &count)) return false;
     for(size_t i = 0; i < count; ++i) {
@@ -524,11 +544,20 @@ static bool ctap2_parse_user_presence_option(CborReader* reader, bool* user_pres
         size_t key_length;
         if(!cbor_read_bytes(reader, 3, &key, &key_length)) return false;
         if(cbor_text_equals(key, key_length, "up")) {
-            if(!cbor_read_bool(reader, user_presence)) return false;
+            if(!cbor_read_bool(reader, &request->user_presence)) return false;
+        } else if(cbor_text_equals(key, key_length, "rk")) {
+            if(!cbor_read_bool(reader, &request->resident_key)) return false;
         } else if(!cbor_skip(reader)) {
             return false;
         }
     }
+    return true;
+}
+
+static bool ctap2_parse_user_presence_option(CborReader* reader, bool* user_presence) {
+    MakeCredentialRequest options = {.user_presence = *user_presence};
+    if(!ctap2_parse_make_options(reader, &options)) return false;
+    *user_presence = options.user_presence;
     return true;
 }
 
@@ -546,16 +575,19 @@ static bool ctap2_parse_make_credential(
         if(!cbor_read_uint(&reader, &key)) return false;
         if(key == 2) {
             if(!ctap2_parse_rp(&reader, &request->rp_id, &request->rp_id_len)) return false;
+        } else if(key == 3) {
+            if(!ctap2_parse_user(&reader, &request->user_id, &request->user_id_len)) return false;
         } else if(key == 6) {
             if(!ctap2_parse_make_extensions(&reader, &request->hmac_secret)) return false;
         } else if(key == 7) {
-            if(!ctap2_parse_user_presence_option(&reader, &request->user_presence)) return false;
+            if(!ctap2_parse_make_options(&reader, request)) return false;
         } else if(!cbor_skip(&reader)) {
             return false;
         }
     }
     return !reader.error && reader.ptr == reader.end && request->rp_id &&
-           request->rp_id_len <= CTAP2_MAX_RP_ID_SIZE;
+           request->rp_id_len <= CTAP2_MAX_RP_ID_SIZE &&
+           (!request->resident_key || (request->user_id && request->user_id_len <= U2F_RESIDENT_USER_ID_MAX));
 }
 
 static bool ctap2_parse_credential_list(
@@ -670,6 +702,7 @@ static bool ctap2_parse_get_assertion(
             if(!ctap2_parse_credential_list(
                    &reader, &request->credential_id, &request->credential_id_len))
                 return false;
+            request->allow_list_present = true;
         } else if(key == 4) {
             if(!ctap2_parse_get_extensions(&reader, request)) return false;
         } else if(key == 5) {
@@ -693,6 +726,46 @@ static bool ctap2_credential_tag(
         ctap2->device_key, label, sizeof(label) - 1, rp_hash, 32, nonce, 32, tag);
 }
 
+static bool ctap2_store_resident_credential(
+    const MakeCredentialRequest* request, const uint8_t credential_id[CTAP2_CREDENTIAL_ID_SIZE]) {
+    U2fResidentCredentials credentials;
+    if(!u2f_data_resident_load(&credentials)) return false;
+
+    size_t slot = credentials.count;
+    for(size_t i = 0; i < credentials.count; ++i) {
+        U2fResidentCredential* existing = &credentials.credential[i];
+        if(existing->rp_id_len == request->rp_id_len && existing->user_id_len == request->user_id_len &&
+           memcmp(existing->rp_id, request->rp_id, request->rp_id_len) == 0 &&
+           memcmp(existing->user_id, request->user_id, request->user_id_len) == 0) {
+            slot = i;
+            break;
+        }
+    }
+    if(slot == credentials.count) {
+        if(credentials.count == U2F_RESIDENT_MAX_CREDENTIALS) return false;
+        credentials.count++;
+    }
+    U2fResidentCredential* record = &credentials.credential[slot];
+    memset(record, 0, sizeof(*record));
+    record->rp_id_len = request->rp_id_len;
+    record->user_id_len = request->user_id_len;
+    memcpy(record->rp_id, request->rp_id, request->rp_id_len);
+    memcpy(record->user_id, request->user_id, request->user_id_len);
+    memcpy(record->credential_id, credential_id, CTAP2_CREDENTIAL_ID_SIZE);
+    return u2f_data_resident_save(&credentials);
+}
+
+static const U2fResidentCredential* ctap2_find_resident_credential(
+    const uint8_t* rp_id, size_t rp_id_len, U2fResidentCredentials* credentials) {
+    if(!u2f_data_resident_load(credentials)) return NULL;
+    for(size_t i = 0; i < credentials->count; ++i) {
+        const U2fResidentCredential* record = &credentials->credential[i];
+        if(record->rp_id_len == rp_id_len && memcmp(record->rp_id, rp_id, rp_id_len) == 0)
+            return record;
+    }
+    return NULL;
+}
+
 static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
     CborWriter writer = {.ptr = output + 1, .end = output + output_size};
     output[0] = CTAP2_OK;
@@ -713,7 +786,7 @@ static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
     cbor_write_uint(&writer, 4); /* options */
     cbor_write_map(&writer, 4);
     cbor_write_text(&writer, "rk");
-    cbor_write_bool(&writer, false);
+    cbor_write_bool(&writer, true);
     cbor_write_text(&writer, "up");
     cbor_write_bool(&writer, true);
     cbor_write_text(&writer, "plat");
@@ -802,6 +875,9 @@ static uint16_t ctap2_make_credential(
        !ctap2_make_valid_private(ctap2, "FIDO2 signing", rp_hash, credential_id, private_key) ||
        !ctap2_public_key(ctap2, private_key, public_x, public_y))
         return 0;
+
+    if(request.resident_key && !ctap2_store_resident_credential(&request, credential_id))
+        return CTAP2_ERR_KEY_STORE_FULL;
 
     /* The ED flag and trailing extension map must always be emitted together. */
     const bool has_extension_data = request.hmac_secret;
@@ -912,6 +988,16 @@ static uint16_t ctap2_get_assertion(
         request.salt_auth_len != 16))
         return CTAP2_ERR_INVALID_PARAMETER;
 
+    U2fResidentCredentials resident_credentials;
+    const U2fResidentCredential* resident_credential = NULL;
+    if(!request.allow_list_present) {
+        resident_credential =
+            ctap2_find_resident_credential(request.rp_id, request.rp_id_len, &resident_credentials);
+        if(!resident_credential) return CTAP2_ERR_NO_CREDENTIALS;
+        request.credential_id = resident_credential->credential_id;
+        request.credential_id_len = CTAP2_CREDENTIAL_ID_SIZE;
+    }
+
     /*
      * Ordinary WebAuthn assertions require a physical confirmation.  Preserve
      * the existing explicit up=false path used by unattended disk unlock.
@@ -1002,7 +1088,7 @@ static uint16_t ctap2_get_assertion(
 
     CborWriter writer = {.ptr = output + 1, .end = output + output_size};
     output[0] = CTAP2_OK;
-    cbor_write_map(&writer, 3);
+    cbor_write_map(&writer, resident_credential ? 4 : 3);
     cbor_write_uint(&writer, 1);
     cbor_write_map(&writer, 2);
     cbor_write_text(&writer, "id");
@@ -1013,6 +1099,12 @@ static uint16_t ctap2_get_assertion(
     cbor_write_bytes(&writer, auth_data, auth_data_length);
     cbor_write_uint(&writer, 3);
     cbor_write_bytes(&writer, signature, signature_length);
+    if(resident_credential) {
+        cbor_write_uint(&writer, 4); /* user */
+        cbor_write_map(&writer, 1);
+        cbor_write_text(&writer, "id");
+        cbor_write_bytes(&writer, resident_credential->user_id, resident_credential->user_id_len);
+    }
 
     memset(private_key, 0, sizeof(private_key));
     memset(credential_secret, 0, sizeof(credential_secret));

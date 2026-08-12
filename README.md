@@ -19,9 +19,9 @@ mntm-012 (Flipper API 87.1).
 - PIN/UV protocol 1 key agreement for `hmac-secret`
 - Compatibility with the stock U2F application's `/ext/u2f` device key and certificate data
 
-The application does not support resident keys, client PINs, or user verification. It emits
-`none` attestation and is not a certified or tamper-resistant hardware authenticator. WebAuthn
-credentials are non-discoverable, so enter your account identifier before using one to sign in.
+The application supports up to eight persistent resident credentials, but does not support client
+PINs or user verification. It emits `none` attestation and is not a certified or tamper-resistant
+hardware authenticator.
 
 ## Build
 

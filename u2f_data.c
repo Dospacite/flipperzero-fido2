@@ -12,6 +12,9 @@
 #define U2F_CERT_KEY_FILE U2F_DATA_FOLDER "assets/cert_key.u2f"
 #define U2F_KEY_FILE      U2F_DATA_FOLDER "key.u2f"
 #define U2F_CNT_FILE      U2F_DATA_FOLDER "cnt.u2f"
+#define U2F_RESIDENT_FILE U2F_DATA_FOLDER "resident.u2f"
+
+#define U2F_RESIDENT_MAGIC 0x52324655 /* "U2FR" */
 
 #define U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_FACTORY 2
 #define U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_UNIQUE  FURI_HAL_CRYPTO_ENCLAVE_UNIQUE_KEY_SLOT
@@ -469,4 +472,43 @@ bool u2f_data_cnt_write(uint32_t cnt_val) {
     furi_record_close(RECORD_STORAGE);
 
     return state;
+}
+
+bool u2f_data_resident_load(U2fResidentCredentials* credentials) {
+    furi_assert(credentials);
+    memset(credentials, 0, sizeof(*credentials));
+    credentials->magic = U2F_RESIDENT_MAGIC;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    bool result = true; /* no file means no discoverable credentials yet */
+    if(storage_file_open(file, U2F_RESIDENT_FILE, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        result = storage_file_size(file) == sizeof(*credentials) &&
+                 storage_file_read(file, credentials, sizeof(*credentials)) == sizeof(*credentials) &&
+                 credentials->magic == U2F_RESIDENT_MAGIC &&
+                 credentials->count <= U2F_RESIDENT_MAX_CREDENTIALS;
+        if(!result) {
+            memset(credentials, 0, sizeof(*credentials));
+            credentials->magic = U2F_RESIDENT_MAGIC;
+        }
+    }
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    return result;
+}
+
+bool u2f_data_resident_save(const U2fResidentCredentials* credentials) {
+    furi_assert(credentials);
+    if(credentials->magic != U2F_RESIDENT_MAGIC ||
+       credentials->count > U2F_RESIDENT_MAX_CREDENTIALS)
+        return false;
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    bool result = storage_file_open(file, U2F_RESIDENT_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS) &&
+                  storage_file_write(file, credentials, sizeof(*credentials)) == sizeof(*credentials);
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+    return result;
 }
