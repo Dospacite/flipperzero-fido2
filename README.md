@@ -57,18 +57,6 @@ ufbt launch
 
 The application must remain open for the host to discover and use the security key.
 
-## Browser and OpenAI use
-
-1. Open **FIDO2 Security Key** on the Flipper and keep it open while connected over USB.
-2. On the site, choose the **Security key** option where one is offered.
-3. During registration or sign-in, enter the security-key PIN in the browser's native dialog when
-   requested, then confirm the operation with the Flipper's center **OK** button.
-
-The browser may label the resulting WebAuthn credential as a *passkey*. That is OpenAI's generic
-label for WebAuthn credentials; when the Security key transport is selected, it remains a
-hardware-backed USB security-key credential. The PIN flow supplies WebAuthn user verification, as
-required by OpenAI's advanced-account-security enrollment and sign-in flows.
-
 ## LUKS enrollment
 
 Back up the LUKS2 header before enrolling any new unlock method. With the application running and
