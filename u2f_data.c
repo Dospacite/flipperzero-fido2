@@ -13,6 +13,7 @@
 #define U2F_KEY_FILE      U2F_DATA_FOLDER "key.u2f"
 #define U2F_CNT_FILE      U2F_DATA_FOLDER "cnt.u2f"
 #define U2F_RESIDENT_FILE U2F_DATA_FOLDER "resident.u2f"
+#define U2F_PIN_FILE      U2F_DATA_FOLDER "pin.u2f"
 
 #define U2F_RESIDENT_MAGIC 0x52324655 /* "U2FR" */
 
@@ -30,6 +31,9 @@
 #define U2F_DEVICE_KEY_FILE_TYPE "Flipper U2F Device Key File"
 #define U2F_DEVICE_KEY_VERSION   1
 
+#define U2F_PIN_FILE_TYPE    "Flipper U2F PIN File"
+#define U2F_PIN_FILE_VERSION 1
+
 #define U2F_COUNTER_FILE_TYPE   "Flipper U2F Counter File"
 #define U2F_COUNTER_VERSION     2
 #define U2F_COUNTER_VERSION_OLD 1
@@ -41,6 +45,12 @@ typedef struct {
     uint8_t random_salt[24];
     uint32_t control;
 } FURI_PACKED U2fCounterData;
+
+typedef struct {
+    uint8_t pin_hash[32];
+    uint8_t retries;
+    uint8_t random_salt[15];
+} FURI_PACKED U2fPinData;
 
 bool u2f_data_check(bool cert_only) {
     bool state = false;
@@ -484,7 +494,8 @@ bool u2f_data_resident_load(U2fResidentCredentials* credentials) {
     bool result = true; /* no file means no discoverable credentials yet */
     if(storage_file_open(file, U2F_RESIDENT_FILE, FSAM_READ, FSOM_OPEN_EXISTING)) {
         result = storage_file_size(file) == sizeof(*credentials) &&
-                 storage_file_read(file, credentials, sizeof(*credentials)) == sizeof(*credentials) &&
+                 storage_file_read(file, credentials, sizeof(*credentials)) ==
+                     sizeof(*credentials) &&
                  credentials->magic == U2F_RESIDENT_MAGIC &&
                  credentials->count <= U2F_RESIDENT_MAX_CREDENTIALS;
         if(!result) {
@@ -506,9 +517,87 @@ bool u2f_data_resident_save(const U2fResidentCredentials* credentials) {
     Storage* storage = furi_record_open(RECORD_STORAGE);
     File* file = storage_file_alloc(storage);
     bool result = storage_file_open(file, U2F_RESIDENT_FILE, FSAM_WRITE, FSOM_CREATE_ALWAYS) &&
-                  storage_file_write(file, credentials, sizeof(*credentials)) == sizeof(*credentials);
+                  storage_file_write(file, credentials, sizeof(*credentials)) ==
+                      sizeof(*credentials);
     storage_file_close(file);
     storage_file_free(file);
     furi_record_close(RECORD_STORAGE);
+    return result;
+}
+
+bool u2f_data_pin_load(uint8_t pin_hash[32], uint8_t* retries) {
+    furi_assert(pin_hash);
+    furi_assert(retries);
+
+    bool result = false;
+    uint8_t iv[16];
+    uint8_t encrypted[sizeof(U2fPinData) + 16];
+    U2fPinData data;
+    uint32_t version = 0;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FlipperFormat* flipper_format = flipper_format_file_alloc(storage);
+    FuriString* filetype = furi_string_alloc();
+
+    if(flipper_format_file_open_existing(flipper_format, U2F_PIN_FILE)) {
+        do {
+            if(!flipper_format_read_header(flipper_format, filetype, &version) ||
+               strcmp(furi_string_get_cstr(filetype), U2F_PIN_FILE_TYPE) != 0 ||
+               version != U2F_PIN_FILE_VERSION ||
+               !flipper_format_read_hex(flipper_format, "IV", iv, sizeof(iv)) ||
+               !flipper_format_read_hex(flipper_format, "Data", encrypted, sizeof(encrypted)) ||
+               !furi_hal_crypto_enclave_load_key(U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_UNIQUE, iv))
+                break;
+
+            result = furi_hal_crypto_decrypt(encrypted, (uint8_t*)&data, sizeof(data));
+            furi_hal_crypto_enclave_unload_key(U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_UNIQUE);
+            if(!result) break;
+
+            memcpy(pin_hash, data.pin_hash, sizeof(data.pin_hash));
+            *retries = data.retries;
+        } while(false);
+    }
+
+    memset(&data, 0, sizeof(data));
+    memset(encrypted, 0, sizeof(encrypted));
+    flipper_format_free(flipper_format);
+    furi_string_free(filetype);
+    furi_record_close(RECORD_STORAGE);
+    return result;
+}
+
+bool u2f_data_pin_save(const uint8_t pin_hash[32], uint8_t retries) {
+    furi_assert(pin_hash);
+
+    bool result = false;
+    uint8_t iv[16];
+    uint8_t encrypted[sizeof(U2fPinData) + 16];
+    U2fPinData data;
+    memset(&data, 0, sizeof(data));
+    memcpy(data.pin_hash, pin_hash, sizeof(data.pin_hash));
+    data.retries = retries;
+    furi_hal_random_fill_buf(data.random_salt, sizeof(data.random_salt));
+    furi_hal_random_fill_buf(iv, sizeof(iv));
+
+    if(!furi_hal_crypto_enclave_load_key(U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_UNIQUE, iv)) goto done;
+    result = furi_hal_crypto_encrypt((uint8_t*)&data, encrypted, sizeof(data));
+    furi_hal_crypto_enclave_unload_key(U2F_DATA_FILE_ENCRYPTION_KEY_SLOT_UNIQUE);
+    if(!result) goto done;
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FlipperFormat* flipper_format = flipper_format_file_alloc(storage);
+    result = false;
+    if(flipper_format_file_open_always(flipper_format, U2F_PIN_FILE)) {
+        result = flipper_format_write_header_cstr(
+                     flipper_format, U2F_PIN_FILE_TYPE, U2F_PIN_FILE_VERSION) &&
+                 flipper_format_write_hex(flipper_format, "IV", iv, sizeof(iv)) &&
+                 flipper_format_write_hex(flipper_format, "Data", encrypted, sizeof(encrypted));
+    }
+    flipper_format_free(flipper_format);
+    furi_record_close(RECORD_STORAGE);
+
+done:
+    memset(&data, 0, sizeof(data));
+    memset(encrypted, 0, sizeof(encrypted));
     return result;
 }

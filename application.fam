@@ -4,7 +4,6 @@ App(
     apptype=FlipperAppType.EXTERNAL,
     entry_point="u2f_app",
     stack_size=2 * 1024,
-    icon="A_U2F_14",
     order=80,
     fap_libs=["assets", "mbedtls"],
     fap_category="USB",

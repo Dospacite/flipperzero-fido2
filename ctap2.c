@@ -26,12 +26,24 @@
 #define CTAP2_ERR_CREDENTIAL_EXCLUDED  0x19
 #define CTAP2_ERR_OPERATION_DENIED     0x27
 #define CTAP2_ERR_KEY_STORE_FULL       0x28
+#define CTAP2_ERR_PIN_INVALID          0x31
+#define CTAP2_ERR_PIN_BLOCKED          0x32
+#define CTAP2_ERR_PIN_AUTH_INVALID     0x33
+#define CTAP2_ERR_PIN_NOT_SET          0x35
+#define CTAP2_ERR_PIN_REQUIRED         0x36
+#define CTAP2_ERR_PIN_POLICY_VIOLATION 0x37
 #define CTAP2_ERR_NO_CREDENTIALS       0x2E
 #define CTAP2_ERR_INTEGRITY_FAILURE    0x3D
 #define CTAP2_ERR_UNSUPPORTED_OPTION   0x2B
 
 #define CTAP2_CREDENTIAL_ID_SIZE 64
 #define CTAP2_MAX_RP_ID_SIZE     253
+#define CTAP2_PIN_HASH_SIZE      32
+#define CTAP2_PIN_HASH_ENC_SIZE  16
+#define CTAP2_PIN_TOKEN_SIZE     32
+#define CTAP2_PIN_RETRIES_MAX    8
+#define CTAP2_PIN_MIN_LENGTH     4
+#define CTAP2_PIN_ENC_SIZE       64
 
 /* Stable, project-specific AAGUID. This authenticator intentionally has no attestation key. */
 static const uint8_t ctap2_aaguid[16] = {
@@ -66,14 +78,34 @@ typedef struct {
 } CborWriter;
 
 typedef struct {
+    const uint8_t* client_data_hash;
+    size_t client_data_hash_len;
     const uint8_t* rp_id;
     size_t rp_id_len;
     const uint8_t* user_id;
     size_t user_id_len;
     bool hmac_secret;
     bool user_presence;
+    bool user_verification;
     bool resident_key;
+    const uint8_t* pin_auth;
+    size_t pin_auth_len;
+    uint64_t pin_protocol;
 } MakeCredentialRequest;
+
+typedef struct {
+    uint64_t protocol;
+    uint64_t subcommand;
+    uint8_t key_x[32];
+    uint8_t key_y[32];
+    bool key_agreement_present;
+    const uint8_t* pin_auth;
+    size_t pin_auth_len;
+    const uint8_t* new_pin_enc;
+    size_t new_pin_enc_len;
+    const uint8_t* pin_hash_enc;
+    size_t pin_hash_enc_len;
+} ClientPinRequest;
 
 typedef struct {
     const uint8_t* rp_id;
@@ -92,6 +124,9 @@ typedef struct {
     uint64_t pin_protocol;
     bool hmac_secret;
     bool user_presence;
+    bool user_verification;
+    const uint8_t* pin_auth;
+    size_t pin_auth_len;
 } GetAssertionRequest;
 
 struct Ctap2 {
@@ -99,12 +134,28 @@ struct Ctap2 {
     uint8_t key_agreement_private[32];
     uint8_t key_agreement_x[32];
     uint8_t key_agreement_y[32];
+    uint8_t pin_hash[CTAP2_PIN_HASH_SIZE];
+    uint8_t pin_token[CTAP2_PIN_TOKEN_SIZE];
+    uint8_t pin_retries;
+    bool pin_set;
     mbedtls_ecp_group group;
     Ctap2UserPresenceRequest request_user_presence;
     Ctap2UserPresenceConsume consume_user_presence;
     Ctap2Keepalive send_keepalive;
     void* user_presence_context;
 };
+
+static bool ctap2_shared_secret(
+    Ctap2* ctap2,
+    const uint8_t peer_x[32],
+    const uint8_t peer_y[32],
+    uint8_t shared_secret[32]);
+static bool ctap2_aes_cbc(
+    const uint8_t key[32],
+    bool encrypt,
+    const uint8_t* input,
+    size_t length,
+    uint8_t* output);
 
 /* Browser CTAP transactions normally have a 30-second timeout. */
 #define CTAP2_USER_PRESENCE_TIMEOUT_MS 15000
@@ -531,7 +582,8 @@ static bool ctap2_parse_user(CborReader* reader, const uint8_t** user_id, size_t
         if(!cbor_read_bytes(reader, 3, &key, &key_len)) return false;
         if(cbor_text_equals(key, key_len, "id")) {
             if(!cbor_read_bytes(reader, 2, user_id, user_id_len)) return false;
-        } else if(!cbor_skip(reader)) return false;
+        } else if(!cbor_skip(reader))
+            return false;
     }
     return *user_id != NULL;
 }
@@ -547,6 +599,8 @@ static bool ctap2_parse_make_options(CborReader* reader, MakeCredentialRequest* 
             if(!cbor_read_bool(reader, &request->user_presence)) return false;
         } else if(cbor_text_equals(key, key_length, "rk")) {
             if(!cbor_read_bool(reader, &request->resident_key)) return false;
+        } else if(cbor_text_equals(key, key_length, "uv")) {
+            if(!cbor_read_bool(reader, &request->user_verification)) return false;
         } else if(!cbor_skip(reader)) {
             return false;
         }
@@ -554,10 +608,21 @@ static bool ctap2_parse_make_options(CborReader* reader, MakeCredentialRequest* 
     return true;
 }
 
-static bool ctap2_parse_user_presence_option(CborReader* reader, bool* user_presence) {
-    MakeCredentialRequest options = {.user_presence = *user_presence};
-    if(!ctap2_parse_make_options(reader, &options)) return false;
-    *user_presence = options.user_presence;
+static bool ctap2_parse_get_options(CborReader* reader, GetAssertionRequest* request) {
+    size_t count;
+    if(!cbor_enter(reader, 5, &count)) return false;
+    for(size_t i = 0; i < count; ++i) {
+        const uint8_t* key;
+        size_t key_length;
+        if(!cbor_read_bytes(reader, 3, &key, &key_length)) return false;
+        if(cbor_text_equals(key, key_length, "up")) {
+            if(!cbor_read_bool(reader, &request->user_presence)) return false;
+        } else if(cbor_text_equals(key, key_length, "uv")) {
+            if(!cbor_read_bool(reader, &request->user_verification)) return false;
+        } else if(!cbor_skip(reader)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -573,7 +638,11 @@ static bool ctap2_parse_make_credential(
     for(size_t i = 0; i < count; ++i) {
         uint64_t key;
         if(!cbor_read_uint(&reader, &key)) return false;
-        if(key == 2) {
+        if(key == 1) {
+            if(!cbor_read_bytes(
+                   &reader, 2, &request->client_data_hash, &request->client_data_hash_len))
+                return false;
+        } else if(key == 2) {
             if(!ctap2_parse_rp(&reader, &request->rp_id, &request->rp_id_len)) return false;
         } else if(key == 3) {
             if(!ctap2_parse_user(&reader, &request->user_id, &request->user_id_len)) return false;
@@ -581,13 +650,20 @@ static bool ctap2_parse_make_credential(
             if(!ctap2_parse_make_extensions(&reader, &request->hmac_secret)) return false;
         } else if(key == 7) {
             if(!ctap2_parse_make_options(&reader, request)) return false;
+        } else if(key == 8) {
+            if(!cbor_read_bytes(&reader, 2, &request->pin_auth, &request->pin_auth_len))
+                return false;
+        } else if(key == 9) {
+            if(!cbor_read_uint(&reader, &request->pin_protocol)) return false;
         } else if(!cbor_skip(&reader)) {
             return false;
         }
     }
-    return !reader.error && reader.ptr == reader.end && request->rp_id &&
+    return !reader.error && reader.ptr == reader.end && request->client_data_hash &&
+           request->client_data_hash_len == 32 && request->rp_id &&
            request->rp_id_len <= CTAP2_MAX_RP_ID_SIZE &&
-           (!request->resident_key || (request->user_id && request->user_id_len <= U2F_RESIDENT_USER_ID_MAX));
+           (!request->resident_key ||
+            (request->user_id && request->user_id_len <= U2F_RESIDENT_USER_ID_MAX));
 }
 
 static bool ctap2_parse_credential_list(
@@ -637,6 +713,38 @@ static bool ctap2_parse_cose_key(CborReader* reader, uint8_t x[32], uint8_t y[32
         }
     }
     return got_x && got_y;
+}
+
+static bool
+    ctap2_parse_client_pin(const uint8_t* input, size_t input_length, ClientPinRequest* request) {
+    memset(request, 0, sizeof(*request));
+    CborReader reader = {.ptr = input, .end = input + input_length};
+    size_t count;
+    if(!cbor_enter(&reader, 5, &count)) return false;
+    for(size_t i = 0; i < count; ++i) {
+        uint64_t key;
+        if(!cbor_read_uint(&reader, &key)) return false;
+        if(key == 1) {
+            if(!cbor_read_uint(&reader, &request->protocol)) return false;
+        } else if(key == 2) {
+            if(!cbor_read_uint(&reader, &request->subcommand)) return false;
+        } else if(key == 3) {
+            if(!ctap2_parse_cose_key(&reader, request->key_x, request->key_y)) return false;
+            request->key_agreement_present = true;
+        } else if(key == 4) {
+            if(!cbor_read_bytes(&reader, 2, &request->pin_auth, &request->pin_auth_len))
+                return false;
+        } else if(key == 5) {
+            if(!cbor_read_bytes(&reader, 2, &request->new_pin_enc, &request->new_pin_enc_len))
+                return false;
+        } else if(key == 6) {
+            if(!cbor_read_bytes(&reader, 2, &request->pin_hash_enc, &request->pin_hash_enc_len))
+                return false;
+        } else if(!cbor_skip(&reader)) {
+            return false;
+        }
+    }
+    return !reader.error && reader.ptr == reader.end;
 }
 
 static bool ctap2_parse_hmac_secret(CborReader* reader, GetAssertionRequest* request) {
@@ -706,7 +814,12 @@ static bool ctap2_parse_get_assertion(
         } else if(key == 4) {
             if(!ctap2_parse_get_extensions(&reader, request)) return false;
         } else if(key == 5) {
-            if(!ctap2_parse_user_presence_option(&reader, &request->user_presence)) return false;
+            if(!ctap2_parse_get_options(&reader, request)) return false;
+        } else if(key == 6) {
+            if(!cbor_read_bytes(&reader, 2, &request->pin_auth, &request->pin_auth_len))
+                return false;
+        } else if(key == 7) {
+            if(!cbor_read_uint(&reader, &request->pin_protocol)) return false;
         } else if(!cbor_skip(&reader)) {
             return false;
         }
@@ -727,14 +840,16 @@ static bool ctap2_credential_tag(
 }
 
 static bool ctap2_store_resident_credential(
-    const MakeCredentialRequest* request, const uint8_t credential_id[CTAP2_CREDENTIAL_ID_SIZE]) {
+    const MakeCredentialRequest* request,
+    const uint8_t credential_id[CTAP2_CREDENTIAL_ID_SIZE]) {
     U2fResidentCredentials credentials;
     if(!u2f_data_resident_load(&credentials)) return false;
 
     size_t slot = credentials.count;
     for(size_t i = 0; i < credentials.count; ++i) {
         U2fResidentCredential* existing = &credentials.credential[i];
-        if(existing->rp_id_len == request->rp_id_len && existing->user_id_len == request->user_id_len &&
+        if(existing->rp_id_len == request->rp_id_len &&
+           existing->user_id_len == request->user_id_len &&
            memcmp(existing->rp_id, request->rp_id, request->rp_id_len) == 0 &&
            memcmp(existing->user_id, request->user_id, request->user_id_len) == 0) {
             slot = i;
@@ -756,7 +871,9 @@ static bool ctap2_store_resident_credential(
 }
 
 static const U2fResidentCredential* ctap2_find_resident_credential(
-    const uint8_t* rp_id, size_t rp_id_len, U2fResidentCredentials* credentials) {
+    const uint8_t* rp_id,
+    size_t rp_id_len,
+    U2fResidentCredentials* credentials) {
     if(!u2f_data_resident_load(credentials)) return NULL;
     for(size_t i = 0; i < credentials->count; ++i) {
         const U2fResidentCredential* record = &credentials->credential[i];
@@ -766,7 +883,7 @@ static const U2fResidentCredential* ctap2_find_resident_credential(
     return NULL;
 }
 
-static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
+static uint16_t ctap2_get_info(Ctap2* ctap2, uint8_t* output, size_t output_size) {
     CborWriter writer = {.ptr = output + 1, .end = output + output_size};
     output[0] = CTAP2_OK;
     cbor_write_map(&writer, 9);
@@ -792,8 +909,7 @@ static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
     cbor_write_text(&writer, "plat");
     cbor_write_bool(&writer, false);
     cbor_write_text(&writer, "clientPin");
-    cbor_write_bool(&writer, false);
-
+    cbor_write_bool(&writer, ctap2->pin_set);
     cbor_write_uint(&writer, 5); /* maxMsgSize */
     cbor_write_uint(&writer, 7609);
     cbor_write_uint(&writer, 6); /* pinUvAuthProtocols */
@@ -814,37 +930,168 @@ static uint16_t ctap2_get_info(uint8_t* output, size_t output_size) {
     return writer.error ? 0 : writer.ptr - output;
 }
 
+static uint16_t ctap2_pin_failure(Ctap2* ctap2) {
+    if(ctap2->pin_retries > 0) ctap2->pin_retries--;
+    if(!u2f_data_pin_save(ctap2->pin_hash, ctap2->pin_retries)) return CTAP2_ERR_OPERATION_DENIED;
+    return ctap2->pin_retries ? CTAP2_ERR_PIN_INVALID : CTAP2_ERR_PIN_BLOCKED;
+}
+
+static uint16_t ctap2_decrypt_new_pin(
+    const ClientPinRequest* request,
+    const uint8_t shared_secret[32],
+    uint8_t pin_hash[32]) {
+    if(request->new_pin_enc_len != CTAP2_PIN_ENC_SIZE || request->pin_auth_len != 16)
+        return CTAP2_ERR_MISSING_PARAMETER;
+
+    uint8_t expected_auth[32];
+    uint8_t decrypted[CTAP2_PIN_ENC_SIZE];
+    if(!ctap2_hmac_parts(
+           shared_secret,
+           request->new_pin_enc,
+           request->new_pin_enc_len,
+           NULL,
+           0,
+           NULL,
+           0,
+           expected_auth) ||
+       !ctap2_ct_equal(expected_auth, request->pin_auth, 16) ||
+       !ctap2_aes_cbc(
+           shared_secret, false, request->new_pin_enc, request->new_pin_enc_len, decrypted)) {
+        memset(expected_auth, 0, sizeof(expected_auth));
+        memset(decrypted, 0, sizeof(decrypted));
+        return CTAP2_ERR_PIN_AUTH_INVALID;
+    }
+
+    size_t pin_length = 0;
+    while(pin_length < sizeof(decrypted) && decrypted[pin_length] != 0)
+        pin_length++;
+    bool valid = pin_length >= CTAP2_PIN_MIN_LENGTH && pin_length < sizeof(decrypted);
+    for(size_t i = pin_length; valid && i < sizeof(decrypted); ++i)
+        valid = decrypted[i] == 0;
+    if(valid) valid = ctap2_sha256(decrypted, pin_length, pin_hash);
+
+    memset(expected_auth, 0, sizeof(expected_auth));
+    memset(decrypted, 0, sizeof(decrypted));
+    return valid ? CTAP2_OK : CTAP2_ERR_PIN_POLICY_VIOLATION;
+}
+
+static uint16_t ctap2_verify_pin_hash(
+    Ctap2* ctap2,
+    const ClientPinRequest* request,
+    const uint8_t shared_secret[32]) {
+    if(!ctap2->pin_set) return CTAP2_ERR_PIN_NOT_SET;
+    if(ctap2->pin_retries == 0) return CTAP2_ERR_PIN_BLOCKED;
+    if(request->pin_hash_enc_len != CTAP2_PIN_HASH_ENC_SIZE) return CTAP2_ERR_MISSING_PARAMETER;
+
+    uint8_t pin_hash[CTAP2_PIN_HASH_ENC_SIZE];
+    bool valid =
+        ctap2_aes_cbc(
+            shared_secret, false, request->pin_hash_enc, request->pin_hash_enc_len, pin_hash) &&
+        ctap2_ct_equal(pin_hash, ctap2->pin_hash, sizeof(pin_hash));
+    memset(pin_hash, 0, sizeof(pin_hash));
+    if(!valid) return ctap2_pin_failure(ctap2);
+
+    ctap2->pin_retries = CTAP2_PIN_RETRIES_MAX;
+    if(!u2f_data_pin_save(ctap2->pin_hash, ctap2->pin_retries)) return CTAP2_ERR_OPERATION_DENIED;
+    return CTAP2_OK;
+}
+
 static uint16_t ctap2_client_pin(
     Ctap2* ctap2,
     const uint8_t* input,
     size_t input_length,
     uint8_t* output,
     size_t output_size) {
-    CborReader reader = {.ptr = input, .end = input + input_length};
-    size_t count;
-    uint64_t protocol = 0;
-    uint64_t subcommand = 0;
-    if(!cbor_enter(&reader, 5, &count)) return CTAP2_ERR_INVALID_CBOR;
-    for(size_t i = 0; i < count; ++i) {
-        uint64_t key;
-        if(!cbor_read_uint(&reader, &key)) return CTAP2_ERR_INVALID_CBOR;
-        if(key == 1) {
-            if(!cbor_read_uint(&reader, &protocol)) return CTAP2_ERR_INVALID_CBOR;
-        } else if(key == 2) {
-            if(!cbor_read_uint(&reader, &subcommand)) return CTAP2_ERR_INVALID_CBOR;
-        } else if(!cbor_skip(&reader)) {
-            return CTAP2_ERR_INVALID_CBOR;
-        }
-    }
-    if(protocol != 1 || subcommand != 2) return CTAP2_ERR_INVALID_PARAMETER;
+    ClientPinRequest request;
+    if(!ctap2_parse_client_pin(input, input_length, &request)) return CTAP2_ERR_INVALID_CBOR;
+    if(request.protocol != 1) return CTAP2_ERR_INVALID_PARAMETER;
 
     CborWriter writer = {.ptr = output + 1, .end = output + output_size};
+    if(request.subcommand == 1) { /* getRetries */
+        cbor_write_map(&writer, 1);
+        cbor_write_uint(&writer, 3);
+        cbor_write_uint(&writer, ctap2->pin_retries);
+        if(writer.error) return 0;
+        output[0] = CTAP2_OK;
+        return writer.ptr - output;
+    }
+    if(request.subcommand == 2) { /* getKeyAgreement */
+        cbor_write_map(&writer, 1);
+        cbor_write_uint(&writer, 1);
+        ctap2_write_cose_key(
+            &writer, -25, ctap2->key_agreement_x, ctap2->key_agreement_y); /* ECDH-ES + HKDF-256 */
+        if(writer.error) return 0;
+        output[0] = CTAP2_OK;
+        return writer.ptr - output;
+    }
+    if(!request.key_agreement_present) return CTAP2_ERR_MISSING_PARAMETER;
+
+    uint8_t shared_secret[32];
+    if(!ctap2_shared_secret(ctap2, request.key_x, request.key_y, shared_secret))
+        return CTAP2_ERR_INTEGRITY_FAILURE;
+
+    uint16_t status = CTAP2_ERR_INVALID_COMMAND;
+    if(request.subcommand == 3) { /* setPIN */
+        uint8_t pin_hash[CTAP2_PIN_HASH_SIZE];
+        if(ctap2->pin_set)
+            status = CTAP2_ERR_PIN_AUTH_INVALID;
+        else if((status = ctap2_decrypt_new_pin(&request, shared_secret, pin_hash)) == CTAP2_OK) {
+            status = u2f_data_pin_save(pin_hash, CTAP2_PIN_RETRIES_MAX) ?
+                         CTAP2_OK :
+                         CTAP2_ERR_OPERATION_DENIED;
+            if(status == CTAP2_OK) {
+                memcpy(ctap2->pin_hash, pin_hash, sizeof(pin_hash));
+                ctap2->pin_retries = CTAP2_PIN_RETRIES_MAX;
+                ctap2->pin_set = true;
+                furi_hal_random_fill_buf(ctap2->pin_token, sizeof(ctap2->pin_token));
+            }
+        }
+        memset(pin_hash, 0, sizeof(pin_hash));
+    } else if(request.subcommand == 5) { /* getPinToken */
+        status = ctap2_verify_pin_hash(ctap2, &request, shared_secret);
+        if(status == CTAP2_OK) {
+            uint8_t encrypted_token[CTAP2_PIN_TOKEN_SIZE];
+            if(!ctap2_aes_cbc(
+                   shared_secret,
+                   true,
+                   ctap2->pin_token,
+                   sizeof(ctap2->pin_token),
+                   encrypted_token)) {
+                status = CTAP2_ERR_OPERATION_DENIED;
+            } else {
+                cbor_write_map(&writer, 1);
+                cbor_write_uint(&writer, 2);
+                cbor_write_bytes(&writer, encrypted_token, sizeof(encrypted_token));
+                if(writer.error) status = CTAP2_ERR_OPERATION_DENIED;
+            }
+            memset(encrypted_token, 0, sizeof(encrypted_token));
+        }
+    }
+
+    memset(shared_secret, 0, sizeof(shared_secret));
+    if(status != CTAP2_OK) return status;
     output[0] = CTAP2_OK;
-    cbor_write_map(&writer, 1);
-    cbor_write_uint(&writer, 1);
-    ctap2_write_cose_key(
-        &writer, -25, ctap2->key_agreement_x, ctap2->key_agreement_y); /* ECDH-ES + HKDF-256 */
-    return writer.error ? 0 : writer.ptr - output;
+    return writer.ptr - output;
+}
+
+static uint16_t ctap2_verify_pin_auth(
+    Ctap2* ctap2,
+    const uint8_t client_data_hash[32],
+    const uint8_t* pin_auth,
+    size_t pin_auth_len,
+    uint64_t pin_protocol,
+    bool user_verification) {
+    if(!pin_auth) return user_verification ? CTAP2_ERR_PIN_REQUIRED : CTAP2_OK;
+    if(!ctap2->pin_set) return CTAP2_ERR_PIN_NOT_SET;
+    if(ctap2->pin_retries == 0) return CTAP2_ERR_PIN_BLOCKED;
+    if(pin_protocol != 1 || pin_auth_len != 16) return CTAP2_ERR_PIN_AUTH_INVALID;
+
+    uint8_t expected_auth[32];
+    bool valid = ctap2_hmac_parts(
+                     ctap2->pin_token, client_data_hash, 32, NULL, 0, NULL, 0, expected_auth) &&
+                 ctap2_ct_equal(expected_auth, pin_auth, 16);
+    memset(expected_auth, 0, sizeof(expected_auth));
+    return valid ? CTAP2_OK : CTAP2_ERR_PIN_AUTH_INVALID;
 }
 
 static uint16_t ctap2_make_credential(
@@ -856,6 +1103,16 @@ static uint16_t ctap2_make_credential(
     uint32_t counter) {
     MakeCredentialRequest request;
     if(!ctap2_parse_make_credential(input, input_length, &request)) return CTAP2_ERR_INVALID_CBOR;
+
+    uint16_t pin_status = ctap2_verify_pin_auth(
+        ctap2,
+        request.client_data_hash,
+        request.pin_auth,
+        request.pin_auth_len,
+        request.pin_protocol,
+        request.user_verification);
+    if(pin_status != CTAP2_OK) return pin_status;
+    const bool user_verified = request.pin_auth != NULL;
 
     /* hmac-secret is optional for WebAuthn.  Explicit up=false preserves LUKS. */
     bool webauthn_user_present = false;
@@ -886,7 +1143,7 @@ static uint16_t ctap2_make_credential(
     uint8_t* cursor = auth_data;
     memcpy(cursor, rp_hash, 32);
     cursor += 32;
-    *cursor++ = 0x40 | (webauthn_user_present ? 0x01 : 0) |
+    *cursor++ = 0x40 | (webauthn_user_present ? 0x01 : 0) | (user_verified ? 0x04 : 0) |
                 (has_extension_data ? 0x80 : 0);
     *cursor++ = counter >> 24;
     *cursor++ = counter >> 16;
@@ -988,11 +1245,21 @@ static uint16_t ctap2_get_assertion(
         request.salt_auth_len != 16))
         return CTAP2_ERR_INVALID_PARAMETER;
 
+    uint16_t pin_status = ctap2_verify_pin_auth(
+        ctap2,
+        request.client_data_hash,
+        request.pin_auth,
+        request.pin_auth_len,
+        request.pin_protocol,
+        request.user_verification);
+    if(pin_status != CTAP2_OK) return pin_status;
+    const bool user_verified = request.pin_auth != NULL;
+
     U2fResidentCredentials resident_credentials;
     const U2fResidentCredential* resident_credential = NULL;
     if(!request.allow_list_present) {
-        resident_credential =
-            ctap2_find_resident_credential(request.rp_id, request.rp_id_len, &resident_credentials);
+        resident_credential = ctap2_find_resident_credential(
+            request.rp_id, request.rp_id_len, &resident_credentials);
         if(!resident_credential) return CTAP2_ERR_NO_CREDENTIALS;
         request.credential_id = resident_credential->credential_id;
         request.credential_id_len = CTAP2_CREDENTIAL_ID_SIZE;
@@ -1057,7 +1324,8 @@ static uint16_t ctap2_get_assertion(
     uint8_t* cursor = auth_data;
     memcpy(cursor, rp_hash, 32);
     cursor += 32;
-    *cursor++ = (user_present ? 0x01 : 0) | (request.hmac_secret ? 0x80 : 0);
+    *cursor++ = (user_present ? 0x01 : 0) | (user_verified ? 0x04 : 0) |
+                (request.hmac_secret ? 0x80 : 0);
     *cursor++ = counter >> 24;
     *cursor++ = counter >> 16;
     *cursor++ = counter >> 8;
@@ -1144,6 +1412,12 @@ Ctap2* ctap2_alloc(
         ctap2_free(ctap2);
         return NULL;
     }
+    ctap2->pin_retries = CTAP2_PIN_RETRIES_MAX;
+    if(u2f_data_pin_load(ctap2->pin_hash, &ctap2->pin_retries)) {
+        ctap2->pin_set = true;
+        if(ctap2->pin_retries > CTAP2_PIN_RETRIES_MAX) ctap2->pin_retries = CTAP2_PIN_RETRIES_MAX;
+    }
+    furi_hal_random_fill_buf(ctap2->pin_token, sizeof(ctap2->pin_token));
     return ctap2;
 }
 
@@ -1161,7 +1435,7 @@ uint16_t ctap2_handle(Ctap2* ctap2, uint8_t* buffer, uint16_t length, uint32_t c
     size_t input_length = length - 1;
     uint16_t response_length = 0;
     if(command == CTAP2_CMD_GET_INFO) {
-        response_length = ctap2_get_info(buffer, 7609);
+        response_length = ctap2_get_info(ctap2, buffer, 7609);
     } else if(command == CTAP2_CMD_CLIENT_PIN) {
         response_length = ctap2_client_pin(ctap2, input, input_length, buffer, 7609);
     } else if(command == CTAP2_CMD_MAKE_CREDENTIAL) {

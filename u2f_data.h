@@ -6,9 +6,9 @@ extern "C" {
 
 #include <furi.h>
 
-#define U2F_RESIDENT_MAX_CREDENTIALS 8
-#define U2F_RESIDENT_RP_ID_MAX       253
-#define U2F_RESIDENT_USER_ID_MAX     64
+#define U2F_RESIDENT_MAX_CREDENTIALS    8
+#define U2F_RESIDENT_RP_ID_MAX          253
+#define U2F_RESIDENT_USER_ID_MAX        64
 #define U2F_RESIDENT_CREDENTIAL_ID_SIZE 64
 
 typedef struct {
@@ -44,6 +44,10 @@ bool u2f_data_cnt_write(uint32_t cnt);
 /** Load/save discoverable WebAuthn credentials.  A missing store is empty. */
 bool u2f_data_resident_load(U2fResidentCredentials* credentials);
 bool u2f_data_resident_save(const U2fResidentCredentials* credentials);
+
+/** Load/save the encrypted CTAP2 client-PIN hash and remaining retry count. */
+bool u2f_data_pin_load(uint8_t pin_hash[32], uint8_t* retries);
+bool u2f_data_pin_save(const uint8_t pin_hash[32], uint8_t retries);
 
 #ifdef __cplusplus
 }
