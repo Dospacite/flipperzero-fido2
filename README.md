@@ -6,8 +6,11 @@ confirmation, as well as the CTAP2 `hmac-secret` extension required by `systemd-
 The latter can unlock a LUKS2 volume while the application is running.
 
 This repository contains only the application. It does not require or carry a firmware fork.
-It builds against official Flipper Zero firmware 1.4.3 (Flipper API 87.1); its FIDO transport,
-PIN storage, and cryptography use public Flipper SDK APIs.
+
+## Build target
+
+**Current target: official Flipper Zero firmware 1.4.3 (Flipper API 87.1)**
+The FIDO transport, PIN storage, and cryptography use public Flipper SDK APIs.
 
 ## Features
 
