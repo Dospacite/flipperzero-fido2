@@ -6,8 +6,11 @@ confirmation, as well as the CTAP2 `hmac-secret` extension required by `systemd-
 The latter can unlock a LUKS2 volume while the application is running.
 
 This repository contains only the application. It does not require or carry a firmware fork.
-The current build target is [Momentum Firmware](https://github.com/Next-Flip/Momentum-Firmware)
-mntm-012 (Flipper API 87.1).
+
+## Build target
+
+**Current target: official Flipper Zero firmware 1.4.3 (Flipper API 87.1)**
+The FIDO transport, PIN storage, and cryptography use public Flipper SDK APIs.
 
 ## Features
 
@@ -16,22 +19,40 @@ mntm-012 (Flipper API 87.1).
 - ES256 `authenticatorMakeCredential` with self-contained credential IDs
 - `authenticatorGetAssertion`, including pre-flight assertions
 - WebAuthn user presence: press the Flipper's OK button to register or authenticate
+- CTAP2 client-PIN protocol 1 for browser-mediated user verification, with the PIN hash and
+  retry count encrypted using the Flipper's device-unique key
 - PIN/UV protocol 1 key agreement for `hmac-secret`
 - Compatibility with the stock U2F application's `/ext/u2f` device key and certificate data
 
-The application supports up to eight persistent resident credentials, but does not support client
-PINs or user verification. It emits `none` attestation and is not a certified or tamper-resistant
-hardware authenticator.
+The application supports up to eight persistent resident credentials and browser-mediated
+user verification through a client PIN. It emits `none` attestation and is not a certified or
+tamper-resistant hardware authenticator.
+
+## Interface assets
+
+The app bundles the U2F screen artwork from the official Flipper Zero 1.4.3 source release in its
+own `images/` asset bundle. This preserves the familiar U2F interface while keeping the FAP
+independent of firmware-global icon symbols, so it continues to build and run on official firmware.
+
+## Firmware support and migration
+
+Momentum is not required. The app was built, installed, and exercised as a FIDO2 security key on
+official firmware 1.4.3. Future firmware releases may change the external-app API, so always build
+with an SDK matching the firmware release installed on the Flipper.
+
+The FIDO device key, counter, resident credentials, and PIN state are kept in `/ext/u2f` on the SD
+card. A normal firmware update and `ufbt launch` do not erase that directory. Do not delete it: if
+it is retained while moving from a firmware-integrated U2F app or Momentum, existing credentials
+remain usable and do not need to be re-enrolled.
 
 ## Build
 
-Install [uFBT](https://github.com/flipperdevices/flipperzero-ufbt), download the SDK archive from
-the [Momentum mntm-012 release](https://github.com/Next-Flip/Momentum-Firmware/releases/tag/mntm-012),
-and point uFBT at that archive:
+Install [uFBT](https://github.com/flipperdevices/flipperzero-ufbt), then download the official
+release SDK and build:
 
 ```sh
 python3 -m pip install --upgrade ufbt
-ufbt update --hw-target 7 --local=/path/to/flipper-z-f7-sdk-mntm-012.zip
+ufbt update --channel release
 ufbt
 ```
 
@@ -70,5 +91,5 @@ build remain valid. Firmware updates and app reinstalls must not delete that dir
 
 ## License
 
-GPL-3.0. The application is derived from the Flipper Zero firmware's U2F application and retains
-the same license.
+GPL-3.0. The application is derived from the Flipper Zero firmware's U2F application, including
+the bundled U2F interface assets, and retains the same license.
