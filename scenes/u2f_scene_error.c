@@ -13,9 +13,10 @@ void u2f_scene_error_on_enter(void* context) {
     U2fApp* app = context;
 
     if(app->error == U2fAppErrorNoFiles) {
+        widget_add_icon_element(app->widget, 0, 0, &I_SDQuestion_35x43);
         widget_add_string_multiline_element(
             app->widget,
-            64,
+            81,
             4,
             AlignCenter,
             AlignTop,
@@ -24,13 +25,14 @@ void u2f_scene_error_on_enter(void* context) {
         widget_add_button_element(
             app->widget, GuiButtonTypeLeft, "Back", u2f_scene_error_event_callback, app);
     } else if(app->error == U2fAppErrorCloseRpc) {
+        widget_add_icon_element(app->widget, 78, 0, &I_ActiveConnection_50x64);
         widget_add_string_multiline_element(
-            app->widget, 64, 4, AlignCenter, AlignTop, FontPrimary, "Connection\nIs Active!");
+            app->widget, 3, 2, AlignLeft, AlignTop, FontPrimary, "Connection\nIs Active!");
         widget_add_string_multiline_element(
             app->widget,
-            64,
+            3,
             30,
-            AlignCenter,
+            AlignLeft,
             AlignTop,
             FontSecondary,
             "Disconnect from\nPC or phone to\nuse this function.");

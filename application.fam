@@ -5,7 +5,8 @@ App(
     entry_point="u2f_app",
     stack_size=2 * 1024,
     order=80,
-    fap_libs=["assets", "mbedtls"],
+    fap_libs=["mbedtls"],
     fap_category="USB",
     fap_icon="icon.png",
+    fap_icon_assets="images",
 )

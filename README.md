@@ -25,6 +25,12 @@ The application supports up to eight persistent resident credentials and browser
 user verification through a client PIN. It emits `none` attestation and is not a certified or
 tamper-resistant hardware authenticator.
 
+## Interface assets
+
+The app bundles the U2F screen artwork from the official Flipper Zero 1.4.3 source release in its
+own `images/` asset bundle. This preserves the familiar U2F interface while keeping the FAP
+independent of firmware-global icon symbols, so it continues to build and run on official firmware.
+
 ## Firmware support and migration
 
 Momentum is not required. The app was built, installed, and exercised as a FIDO2 security key on
@@ -82,5 +88,5 @@ build remain valid. Firmware updates and app reinstalls must not delete that dir
 
 ## License
 
-GPL-3.0. The application is derived from the Flipper Zero firmware's U2F application and retains
-the same license.
+GPL-3.0. The application is derived from the Flipper Zero firmware's U2F application, including
+the bundled U2F interface assets, and retains the same license.

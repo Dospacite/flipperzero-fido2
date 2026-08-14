@@ -1,5 +1,6 @@
 #include "u2f_view.h"
 #include <gui/elements.h>
+#include <fido2_security_key_icons.h>
 
 struct U2fView {
     View* view;
@@ -14,25 +15,31 @@ typedef struct {
 static void u2f_view_draw_callback(Canvas* canvas, void* _model) {
     U2fModel* model = _model;
 
-    canvas_draw_frame(canvas, 8, 14, 112, 35);
+    canvas_draw_icon(canvas, 8, 14, &I_Drive_112x35);
     canvas_set_font(canvas, FontSecondary);
 
     if(model->display_msg == U2fMsgNotConnected) {
+        canvas_draw_icon(canvas, 22, 15, &I_Connect_me_62x31);
         canvas_draw_str_aligned(
             canvas, 128 / 2, 3, AlignCenter, AlignTop, "Connect me to computer");
     } else if(model->display_msg == U2fMsgIdle) {
+        canvas_draw_icon(canvas, 22, 15, &I_Connected_62x31);
         canvas_draw_str_aligned(canvas, 128 / 2, 3, AlignCenter, AlignTop, "Connected!");
     } else if(model->display_msg == U2fMsgRegister) {
         elements_button_center(canvas, "OK");
+        canvas_draw_icon(canvas, 22, 15, &I_Auth_62x31);
         canvas_draw_str_aligned(canvas, 128 / 2, 3, AlignCenter, AlignTop, "Press OK to register");
     } else if(model->display_msg == U2fMsgAuth) {
         elements_button_center(canvas, "OK");
+        canvas_draw_icon(canvas, 22, 15, &I_Auth_62x31);
         canvas_draw_str_aligned(
             canvas, 128 / 2, 3, AlignCenter, AlignTop, "Press OK to authenticate");
     } else if(model->display_msg == U2fMsgSuccess) {
+        canvas_draw_icon(canvas, 22, 15, &I_Connected_62x31);
         canvas_draw_str_aligned(
             canvas, 128 / 2, 3, AlignCenter, AlignTop, "Authentication successful!");
     } else if(model->display_msg == U2fMsgError) {
+        canvas_draw_icon(canvas, 22, 15, &I_Error_62x31);
         canvas_draw_str_aligned(canvas, 128 / 2, 3, AlignCenter, AlignTop, "Certificate error");
     }
 }
